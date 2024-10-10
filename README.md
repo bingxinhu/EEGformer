@@ -1,6 +1,5 @@
-# EEGformer: A transformer–based brain activity classification method using EEG signal
-### Zhijiang Wan, Manyu Li, Shichang Liu, Jiajin Huang, Hai Tan, Wenfeng Duan
-Unofficial implementation of [EEGformer](https://doi.org/10.3389/fnins.2023.1148855).
+# EEGformer
+Unofficial implementation of ["_EEGformer : A transformer–based brain activity classification method using EEG signal_" (Wan et al.)](https://doi.org/10.3389/fnins.2023.1148855) in pytorch.
 
 ![Alt text](resources/fnins-17-1148855-g002.jpg)
 
@@ -27,3 +26,7 @@ spe = 0.9875
 >>> epoch 30 -> tp : 189, fp : 10, tn : 790, fn : 11
 ```
 ![Alt text](resources/Figure_1.png)
+
+## TODO
+- [ ] Option for Dropouts
+- [ ] Interpolation
