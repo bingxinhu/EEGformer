@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import math
+from mamba_ssm import Mamba
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -33,7 +34,7 @@ def trunc_normal(tensor, mean=0., std=1., a=-2., b=2.):  # for positional embedd
         return tensor
 
 
-class Mlp(nn.Module): # Multilayer perceptron
+class Mlp(nn.Module):  # Multilayer perceptron
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., dtype=torch.float32):
         super().__init__()
         out_features = out_features or in_features
@@ -50,81 +51,6 @@ class Mlp(nn.Module): # Multilayer perceptron
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
-
-class GenericTFB(nn.Module):
-    def __init__(self, emb_size, num_heads, dtype):
-        super(GenericTFB, self).__init__()
-
-        self.M_size1 = emb_size  # -> D
-        self.dtype = dtype
-        self.hA = num_heads  # number of multi-head self-attention units (A is the number of units in a block)
-        self.Dh = int(self.M_size1 / self.hA)  # Dh is the quotient computed by D/A and denotes the dimension number of three vectors.
-        self.Wqkv = nn.Parameter(torch.randn((3, self.hA, self.Dh, self.M_size1), dtype=self.dtype))
-        self.Wo = nn.Parameter(torch.randn(self.M_size1, self.M_size1, dtype=self.dtype))
-
-        self.lnorm = nn.LayerNorm(self.M_size1, dtype=self.dtype)  # LayerNorm operation for dimension D
-        self.lnormz = nn.LayerNorm(self.M_size1, dtype=self.dtype)  # LayerNorm operation for z
-        self.mlp = Mlp(in_features=self.M_size1, hidden_features=int(self.M_size1 * 4), act_layer=nn.GELU, dtype=self.dtype)  # mlp_ratio=4
-
-    def forward(self, x, savespace):
-        qkvspace = torch.zeros(3, x.shape[2], x.shape[0] + 1, self.hA, self.Dh, dtype=self.dtype).to(device)  # Q, K, V
-        atspace = torch.zeros(x.shape[2], self.hA, x.shape[0] + 1, x.shape[0] + 1, dtype=self.dtype).to(device)
-        imv = torch.zeros(x.shape[2], x.shape[0] + 1, self.hA, self.Dh, dtype=self.dtype).to(device)
-
-        qkvspace = torch.einsum('xhdm,ijm -> xijhd', self.Wqkv, self.lnorm(savespace))  # Q, K, V
-
-        # - Attention score
-        atspace = (qkvspace[0].clone().transpose(1, 2) / math.sqrt(self.Dh)) @ qkvspace[1].clone().transpose(1,2).transpose(-2, -1)
-
-        # - Intermediate vectors
-        imv = (atspace.clone() @ qkvspace[2].clone().transpose(1, 2)).transpose(1, 2)
-
-        # - NOW SAY HELLO TO NEW Z!
-        savespace = torch.einsum('nm,ijm -> ijn', self.Wo, imv.clone().reshape(x.shape[2], x.shape[0] + 1, self.M_size1)) + savespace  # z'
-
-        # - normalized by LN() and passed through a multilayer perceptron (MLP)
-        savespace = self.mlp(self.lnormz(savespace)) + savespace  # new z
-
-        return savespace
-
-
-class TemporalTFB(nn.Module):
-    def __init__(self, emb_size, num_heads, avgf, dtype):
-        super(TemporalTFB, self).__init__()
-
-        self.avgf = avgf  # average factor (M)
-        self.M_size1 = emb_size  # -> D
-        self.dtype = dtype
-        self.hA = num_heads  # number of multi-head self-attention units (A is the number of units in a block)
-        self.Dh = int(self.M_size1 / self.hA)  # Dh is the quotient computed by D/A and denotes the dimension number of three vectors.
-        self.Wqkv = nn.Parameter(torch.randn((3, self.hA, self.Dh, self.M_size1), dtype=self.dtype))
-        self.Wo = nn.Parameter(torch.randn(self.M_size1, self.M_size1, dtype=self.dtype))
-
-        self.lnorm = nn.LayerNorm(self.M_size1, dtype=self.dtype)  # LayerNorm operation for dimension D
-        self.lnormz = nn.LayerNorm(self.M_size1, dtype=self.dtype)  # LayerNorm operation for z
-        self.mlp = Mlp(in_features=self.M_size1, hidden_features=int(self.M_size1 * 4), act_layer=nn.GELU, dtype=self.dtype)  # mlp_ratio=4
-
-    def forward(self, x, savespace):
-        qkvspace = torch.zeros(3, self.avgf + 1, self.hA, self.Dh, dtype=self.dtype).to(device)  # Q, K, V
-        atspace = torch.zeros(self.hA, self.avgf + 1, self.avgf + 1, dtype=self.dtype).to(device)
-        imv = torch.zeros(self.avgf + 1, self.hA, self.Dh, dtype=self.dtype).to(device)
-
-        qkvspace = torch.einsum('xhdm,im -> xihd', self.Wqkv, self.lnorm(savespace))  # Q, K, V
-
-        # - Attention score
-        atspace = (qkvspace[0].clone().transpose(0, 1) / math.sqrt(self.Dh)) @ qkvspace[1].clone().transpose(0, 1).transpose(-2, -1)
-
-        # - Intermediate vectors
-        imv = (atspace.clone() @ qkvspace[2].clone().transpose(0, 1)).transpose(0, 1)
-
-        # - NOW SAY HELLO TO NEW Z!
-        savespace = torch.einsum('nm,im -> in', self.Wo, imv.clone().reshape(self.avgf + 1, self.M_size1)) + savespace  # z'
-
-        # - normalized by LN() and passed through a multilayer perceptron (MLP)
-        savespace = self.mlp(self.lnormz(savespace)) + savespace  # new z
-
-        return savespace
 
 
 class ODCM(nn.Module):
@@ -170,7 +96,7 @@ class RTM(nn.Module):  # Regional transformer module
         self.cls = nn.Parameter(torch.zeros(self.inputshape[2], 1, self.M_size1, dtype=self.dtype))
         trunc_normal(self.bias, std=.02)
         trunc_normal(self.cls, std=.02)
-        self.tfb = nn.ModuleList([GenericTFB(self.M_size1, self.hA, self.dtype) for _ in range(self.tK)])
+        self.mamba = nn.ModuleList([Mamba(d_model=self.M_size1, d_state=16, depth=1, expand=2) for _ in range(self.tK)])
 
     def forward(self, x):
         x = x.transpose(0, 1).transpose(1, 2)  # C x D x S
@@ -180,8 +106,11 @@ class RTM(nn.Module):  # Regional transformer module
         savespace = torch.cat((self.cls, savespace), dim=1)  # ! -> S x (C+1) x D
         savespace = torch.add(savespace, self.bias)  # z -> S x C x D
 
-        for tfb in self.tfb:
-            savespace = tfb(x, savespace)
+        for mamba in self.mamba:
+            # Mamba expects input in shape (batch, seq_len, dim)
+            savespace = savespace.transpose(0, 1)  # (C+1, S, D)
+            savespace = mamba(savespace)
+            savespace = savespace.transpose(0, 1)  # (S, C+1, D)
 
         return savespace  # S x C x D - z4 in the paper
 
@@ -205,7 +134,7 @@ class STM(nn.Module):  # Synchronous transformer module
         self.cls = nn.Parameter(torch.zeros(self.inputshape[2], 1, self.M_size1, dtype=self.dtype))
         trunc_normal(self.bias, std=.02)
         trunc_normal(self.cls, std=.02)
-        self.tfb = nn.ModuleList([GenericTFB(self.M_size1, self.hA, self.dtype) for _ in range(self.tK)])
+        self.mamba = nn.ModuleList([Mamba(d_model=self.M_size1, d_state=16, depth=1, expand=2) for _ in range(self.tK)])
 
     def forward(self, x):  # S x C x D -> x
         x = x.transpose(1, 2)  # S x D x C
@@ -215,8 +144,11 @@ class STM(nn.Module):  # Synchronous transformer module
         savespace = torch.cat((self.cls, savespace), dim=1)  # ! -> from C+1 x S x D to C+1 x S+1 x D
         savespace = torch.add(savespace, self.bias)  # z -> C x S x D
 
-        for tfb in self.tfb:
-            savespace = tfb(x, savespace)
+        for mamba in self.mamba:
+            # Mamba expects input in shape (batch, seq_len, dim)
+            savespace = savespace.transpose(0, 1)  # (S+1, C, D)
+            savespace = mamba(savespace)
+            savespace = savespace.transpose(0, 1)  # (C, S+1, D)
 
         return savespace  # C x S x D - z5 in the paper
 
@@ -245,7 +177,7 @@ class TTM(nn.Module):  # Temporal transformer module
         self.cls = nn.Parameter(torch.zeros(1, self.M_size1, dtype=self.dtype))
         trunc_normal(self.bias, std=.02)
         trunc_normal(self.cls, std=.02)
-        self.tfb = nn.ModuleList([TemporalTFB(self.M_size1, self.hA, self.avgf, self.dtype) for _ in range(self.tK)])
+        self.mamba = nn.ModuleList([Mamba(d_model=self.M_size1, d_state=16, depth=1, expand=2) for _ in range(self.tK)])
 
         self.lnorm_extra = nn.LayerNorm(self.M_size1, dtype=self.dtype)  # EXPERIMENTAL
 
@@ -264,8 +196,10 @@ class TTM(nn.Module):  # Temporal transformer module
         savespace = torch.cat((self.cls, savespace), dim=0)
         savespace = torch.add(savespace, self.bias)  # z -> M x D
 
-        for tfb in self.tfb:
-            savespace = tfb(x, savespace)
+        for mamba in self.mamba:
+            # Mamba expects input in shape (batch, seq_len, dim)
+            savespace = savespace.unsqueeze(0)  # (1, M+1, D)
+            savespace = mamba(savespace).squeeze(0)  # (M+1, D)
 
         savespace = self.lnorm_extra(savespace)  # EXPERIMENTAL
         return savespace.reshape(self.avgf + 1, input.shape[1], input.shape[2])
@@ -290,7 +224,7 @@ class CNNdecoder(nn.Module):  # EEGformer decoder
         x = x.transpose(0, 1).transpose(1, 2)  # S x C x M
         x = self.cvd1(x)  # S x M
         x = self.relu(x)
-        x = x[:, 0, :] # can be replaced with x.squeeze(x,1) in torch 2.0 or higher
+        x = x[:, 0, :]  # can be replaced with x.squeeze(x,1) in torch 2.0 or higher
         x = self.cvd2(x).transpose(0, 1)  # N x M transposed to M x N
         x = self.relu(x)
         x = self.cvd3(x)  # M/2 x N
@@ -343,12 +277,12 @@ class EEGformer(nn.Module):
         wt += self.sa(self.rtm.mlp.fc1.weight) + self.sa(self.rtm.mlp.fc2.weight) + self.sa(self.rtm.lnorm.weight) + self.sa(self.rtm.lnormz.weight) + self.sa(self.rtm.weight)
         wt += self.sa(self.odcm.cvf1.weight) + self.sa(self.odcm.cvf2.weight) + self.sa(self.odcm.cvf3.weight)
 
-        for tfb in self.rtm.tfb:
-            wt += self.sa(tfb.Wo) + self.sa(tfb.Wqkv)
-        for tfb in self.stm.tfb:
-            wt += self.sa(tfb.Wo) + self.sa(tfb.Wqkv)
-        for tfb in self.ttm.tfb:
-            wt += self.sa(tfb.Wo) + self.sa(tfb.Wqkv)
+        for mamba in self.rtm.mamba:
+            wt += self.sa(mamba.layer.weight)
+        for mamba in self.stm.mamba:
+            wt += self.sa(mamba.layer.weight)
+        for mamba in self.ttm.mamba:
+            wt += self.sa(mamba.layer.weight)
 
         ls = -(label * torch.log(xf) + (1 - label) * torch.log(1 - xf))
         ls = torch.mean(ls) + L1_reg_const * wt
